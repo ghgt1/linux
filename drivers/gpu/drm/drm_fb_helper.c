@@ -2045,7 +2045,7 @@ static void drm_fbdev_cleanup(struct drm_fb_helper *fb_helper)
 	}
 
 	drm_fb_helper_fini(fb_helper);
-
+	/* patch -v9*/
 	if (shadow)
 		vfree(shadow);
 	else if (fb_helper->buffer)
