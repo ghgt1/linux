@@ -474,7 +474,7 @@ EXPORT_SYMBOL_GPL(gpiochip_line_is_valid);
 
 static void gpiodevice_release(struct device *dev)
 {
-	struct gpio_device *gdev = container_of(dev, struct gpio_device,dev);
+	struct gpio_device *gdev = container_of(dev, struct gpio_device, dev);
 
 	list_del(&gdev->list);
 	ida_free(&gpio_ida, gdev->id);
@@ -675,7 +675,8 @@ int gpiochip_add_data_with_key(struct gpio_chip *gc, void *data,
 
 	spin_unlock_irqrestore(&gpio_lock, flags);
 
-	BLOCKING_INIT_NOTIFIER_HEAD(&gdev->notifier);
+	BLOCKING_INIT_NOTIFIER_
+    (&gdev->notifier);
 
 #ifdef CONFIG_PINCTRL
 	INIT_LIST_HEAD(&gdev->pin_ranges);

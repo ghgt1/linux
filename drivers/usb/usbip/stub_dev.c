@@ -74,7 +74,7 @@ static ssize_t usbip_sockfd_store(struct device *dev, struct device_attribute *a
 		if (!socket)
 			goto err;
 
-		/* unlock and create threads and get tasks */
+
 		spin_unlock_irq(&sdev->ud.lock);
 		tcp_rx = kthread_create(stub_rx_loop, &sdev->ud, "stub_rx");
 		if (IS_ERR(tcp_rx)) {
@@ -88,7 +88,6 @@ static ssize_t usbip_sockfd_store(struct device *dev, struct device_attribute *a
 			return -EINVAL;
 		}
 
-		/* get task structs now */
 		get_task_struct(tcp_rx);
 		get_task_struct(tcp_tx);
 
