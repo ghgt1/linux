@@ -488,7 +488,7 @@ int qrtr_endpoint_post(struct qrtr_endpoint *ep, const void *data, size_t len)
 		pr_err("qrtr: Invalid version %d\n", ver);
 		goto err;
 	}
-
+	/* patch -v12 */
 	if (!size || len != ALIGN(size, 4) + hdrlen)
 		goto err;
 
