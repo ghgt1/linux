@@ -253,7 +253,7 @@ static int __red_change(struct Qdisc *sch, struct nlattr **tb,
 	ctl = nla_data(tb[TCA_RED_PARMS]);
 	stab = nla_data(tb[TCA_RED_STAB]);
 	if (!red_check_params(ctl->qth_min, ctl->qth_max, ctl->Wlog,
-				ctl->Scell_log, stab))
+			      ctl->Scell_log, stab))
 		return -EINVAL;
 
 	err = red_get_flags(ctl->flags, TC_RED_HISTORIC_FLAGS,

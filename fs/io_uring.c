@@ -377,10 +377,6 @@ struct io_ring_ctx {
 
 	struct io_rings	*rings;
 
-	/*
-	 * For SQPOLL usage
-	 */
-	
 	/* Only used for accounting purposes */
 	struct mm_struct	*mm_account;
 
@@ -707,7 +703,7 @@ enum {
 
 	/* fail rest of links */
 	REQ_F_FAIL_LINK		= BIT(REQ_F_FAIL_LINK_BIT),
-	/* on inflight list */
+	/* on inflight list, should be cancelled and waited on exit reliably */
 	REQ_F_INFLIGHT		= BIT(REQ_F_INFLIGHT_BIT),
 	/* read/write uses file position */
 	REQ_F_CUR_POS		= BIT(REQ_F_CUR_POS_BIT),
@@ -725,7 +721,6 @@ enum {
 	REQ_F_BUFFER_SELECTED	= BIT(REQ_F_BUFFER_SELECTED_BIT),
 	/* doesn't need file table for this request */
 	REQ_F_NO_FILE_TABLE	= BIT(REQ_F_NO_FILE_TABLE_BIT),
-	/* io_wq_work is initialized */
 	/* linked timeout is active, i.e. prepared by link's head */
 	REQ_F_LTIMEOUT_ACTIVE	= BIT(REQ_F_LTIMEOUT_ACTIVE_BIT),
 	/* completion is deferred through io_comp_state */
@@ -1088,7 +1083,6 @@ static inline void req_set_fail_links(struct io_kiocb *req)
 		req->flags |= REQ_F_FAIL_LINK;
 }
 
-
 static void io_ring_ctx_ref_free(struct percpu_ref *ref)
 {
 	struct io_ring_ctx *ctx = container_of(ref, struct io_ring_ctx, refs);
@@ -1171,8 +1165,6 @@ static bool req_need_defer(struct io_kiocb *req, u32 seq)
 	return false;
 }
 
-
-
 static void io_req_track_inflight(struct io_kiocb *req)
 {
 	struct io_ring_ctx *ctx = req->ctx;
@@ -1190,7 +1182,6 @@ static void io_prep_async_work(struct io_kiocb *req)
 {
 	const struct io_op_def *def = &io_op_defs[req->opcode];
 	struct io_ring_ctx *ctx = req->ctx;
-
 
 	if (req->flags & REQ_F_FORCE_ASYNC)
 		req->work.flags |= IO_WQ_WORK_CONCURRENT;
@@ -1659,7 +1650,6 @@ static void io_dismantle_req(struct io_kiocb *req)
 		io_put_file(req, req->file, (req->flags & REQ_F_FIXED_FILE));
 	if (req->fixed_rsrc_refs)
 		percpu_ref_put(req->fixed_rsrc_refs);
-	
 	if (req->flags & REQ_F_INFLIGHT) {
 		struct io_ring_ctx *ctx = req->ctx;
 		unsigned long flags;
@@ -1671,6 +1661,7 @@ static void io_dismantle_req(struct io_kiocb *req)
 	}
 }
 
+/* must to be called somewhat shortly after putting a request */
 static inline void io_put_task(struct task_struct *task, int nr)
 {
 	struct io_uring_task *tctx = task->io_uring;
@@ -1753,12 +1744,6 @@ static void io_fail_links(struct io_kiocb *req)
 
 		trace_io_uring_fail_link(req, link);
 		io_cqring_fill_event(link, -ECANCELED);
-
-		/*
-		 * It's ok to free under spinlock as they're not linked anymore,
-		 * but avoid REQ_F_WORK_INITIALIZED because it may deadlock on
-		 * work.fs->lock.
-		 */
 		io_put_req_deferred(link, 2);
 		link = nxt;
 	}
@@ -1808,7 +1793,6 @@ static void ctx_flush_and_put(struct io_ring_ctx *ctx)
 	percpu_ref_put(&ctx->refs);
 }
 
-
 static bool __tctx_task_work(struct io_uring_task *tctx)
 {
 	struct io_ring_ctx *ctx = NULL;
@@ -1848,9 +1832,10 @@ static void tctx_task_work(struct callback_head *cb)
 	
 	clear_bit(0, &tctx->task_state);
 
+	clear_bit(0, &tctx->task_state);
+
 	while (__tctx_task_work(tctx))
 		cond_resched();
-
 }
 
 static int io_task_work_add(struct task_struct *tsk, struct io_kiocb *req,
@@ -2426,6 +2411,7 @@ static bool io_resubmit_prep(struct io_kiocb *req)
 		return false;
 	return !io_setup_async_rw(req, iovec, inline_vecs, &iter, false);
 }
+
 static bool io_rw_should_reissue(struct io_kiocb *req)
 {
 	umode_t mode = file_inode(req->file)->i_mode;
@@ -2434,7 +2420,8 @@ static bool io_rw_should_reissue(struct io_kiocb *req)
 	if (!S_ISBLK(mode) && !S_ISREG(mode))
 		return false;
 	if ((req->flags & REQ_F_NOWAIT) || (io_wq_current_is_worker() &&
-				!(ctx->flags & IORING_SETUP_IOPOLL)))
+	    !(ctx->flags & IORING_SETUP_IOPOLL)))
+
 		return false;
 	/*
 	 * If ref is dying, we might be running poll reap from the exit work.
@@ -2493,6 +2480,19 @@ static void io_complete_rw_iopoll(struct kiocb *kiocb, long res, long res2)
 {
 	struct io_kiocb *req = container_of(kiocb, struct io_kiocb, rw.kiocb);
 #ifdef CONFIG_BLOCK
+	if (res == -EAGAIN && io_rw_should_reissue(req)) {
+		struct io_async_rw *rw = req->async_data;
+
+		if (rw)
+			iov_iter_revert(&rw->iter,
+					req->result - iov_iter_count(&rw->iter));
+		else if (!io_resubmit_prep(req))
+			res = -EIO;
+	}
+#endif
+
+#ifdef CONFIG_BLOCK
+	/* Rewind iter, if we have one. iopoll path resubmits as usual */
 	if (res == -EAGAIN && io_rw_should_reissue(req)) {
 		struct io_async_rw *rw = req->async_data;
 
@@ -4980,6 +4980,8 @@ static void __io_queue_proc(struct io_poll_iocb *poll, struct io_poll_table *pt,
 			pt->error = -EINVAL;
 			return;
 		}
+
+		/* double add on the same waitqueue head, ignore */
 		if (poll->head == head)
 			return;
 		poll = kmalloc(sizeof(*poll), GFP_ATOMIC);
@@ -6215,10 +6217,7 @@ static void __io_queue_sqe(struct io_kiocb *req)
 	struct io_kiocb *linked_timeout = io_prep_linked_timeout(req);
 	int ret;
 
-
 	ret = io_issue_sqe(req, IO_URING_F_NONBLOCK|IO_URING_F_COMPLETE_DEFER);
-
-
 	/*
 	 * We async punt it if the file wasn't marked NOWAIT, or if the file
 	 * doesn't support non-blocking read/write attempts
@@ -6695,7 +6694,6 @@ static int io_sq_thread(void *data)
 		set_cpus_allowed_ptr(current, cpu_online_mask);
 	current->flags |= PF_NO_SETAFFINITY;
 
-
 	wait_for_completion(&sqd->startup);
 
 	while (!io_sq_thread_should_stop(sqd)) {
@@ -6767,7 +6765,10 @@ static int io_sq_thread(void *data)
 	io_run_task_work();
 
 	/*
-	 * Clear thread under lock so that concurrent parks work correctly
+	 * Ensure that we park properly if racing with someone trying to park
+	 * while we're exiting. If we fail to grab the lock, check park and
+	 * park if necessary. The ordering with the park bit and the lock
+	 * ensures that we catch this reliably.
 	 */
 	if (!mutex_trylock(&sqd->lock)) {
 		if (io_sq_thread_should_park(sqd))
@@ -6779,7 +6780,6 @@ static int io_sq_thread(void *data)
 		ctx->sqo_exec = 1;
 		io_ring_set_wakeup_flag(ctx);
 	}
-	
 	complete(&sqd->exited);
 	mutex_unlock(&sqd->lock);
 	do_exit(0);
@@ -6903,6 +6903,7 @@ static int io_cqring_wait(struct io_ring_ctx *ctx, int min_events,
 	iowq.nr_timeouts = atomic_read(&ctx->cq_timeouts);
 	trace_io_uring_cqring_wait(ctx, min_events);
 	do {
+		/* if we can't even flush overflow, don't wait for more */
 		if (!io_cqring_overflow_flush(ctx, false, NULL, NULL)) {
 			ret = -EBUSY;
 			break;
@@ -7093,7 +7094,7 @@ static void io_sq_thread_park(struct io_sq_data *sqd)
 	__acquires(&sqd->lock)
 {
 	if (sqd->thread == current)
-		return ;
+		return;
 	set_bit(IO_SQ_THREAD_SHOULD_PARK, &sqd->state);
 	mutex_lock(&sqd->lock);
 	if (sqd->thread) {
@@ -8517,18 +8518,17 @@ static bool io_run_ctx_fallback(struct io_ring_ctx *ctx)
 	bool executed = false;
 
 	do {
-		
 		work = xchg(&ctx->exit_task_work, NULL);
 		if (!work)
 			break;
 
-		do {
-			next = work->next;
-			work->func(work);
-			work = next;
-			cond_resched();
-		} while (work);
-		executed = true;
+			do {
+				next = work->next;
+				work->func(work);
+				work = next;
+				cond_resched();
+			} while (work);
+			executed = true;
 	} while (1);
 
 	return executed;
@@ -8546,7 +8546,8 @@ static void io_ring_exit_work(struct work_struct *work)
 	 * as nobody else will be looking for them.
 	 */
 	do {
-		io_uring_try_cancel_requests(ctx, NULL, NULL);		
+		io_uring_try_cancel_requests(ctx, NULL, NULL);
+
 	} while (!wait_for_completion_timeout(&ctx->ref_comp, HZ/20));
 	io_ring_ctx_free(ctx);
 }
@@ -8555,8 +8556,6 @@ static void io_ring_ctx_wait_and_kill(struct io_ring_ctx *ctx)
 {
 	mutex_lock(&ctx->uring_lock);
 	percpu_ref_kill(&ctx->refs);
-
-
 	/* if force is set, the ring is going away. always drop after that */
 	ctx->cq_overflow_flushed = 1;
 	if (ctx->rings)
@@ -8717,7 +8716,6 @@ static void io_uring_cancel_files(struct io_ring_ctx *ctx,
 	}
 }
 
-
 /*
  * We need to iteratively cancel requests, in case a request has dependent
  * hard links. These persist even for failure of cancelations, hence keep
@@ -8729,6 +8727,7 @@ static void io_uring_cancel_task_requests(struct io_ring_ctx *ctx,
 	struct task_struct *task = current;
 
 	if ((ctx->flags & IORING_SETUP_SQPOLL) && ctx->sq_data) {
+		/* never started, nothing to cancel */
 		if (ctx->flags & IORING_SETUP_R_DISABLED) {
 			io_sq_offload_start(ctx);
 			return;
@@ -8747,9 +8746,8 @@ static void io_uring_cancel_task_requests(struct io_ring_ctx *ctx,
 
 	if (task)
 		atomic_dec(&task->io_uring->in_idle);
-	if (ctx->sq_data)	
+	if (ctx->sq_data)
 		io_sq_thread_unpark(ctx->sq_data);
-	
 }
 
 /*
@@ -8777,8 +8775,6 @@ static int io_uring_add_task_file(struct io_ring_ctx *ctx, struct file *file)
 				fput(file);
 				return ret;
 			}
-
-			/* one and only SQPOLL file note, held by sqo_task */
 		}
 		tctx->last = file;
 	}
@@ -8832,6 +8828,7 @@ void __io_uring_files_cancel(struct files_struct *files)
 	xa_for_each(&tctx->xa, index, file)
 		io_uring_cancel_task_requests(file->private_data, files);
 	atomic_dec(&tctx->in_idle);
+
 	if (files)
 		io_uring_clean_tctx(tctx);
 }
@@ -8856,7 +8853,6 @@ static void io_uring_cancel_sqpoll(struct io_ring_ctx *ctx)
 		return;
 	}
 	tctx = ctx->sq_data->thread->io_uring;
-
 	atomic_inc(&tctx->in_idle);
 	do {
 		/* read completions before cancelations */
@@ -8892,7 +8888,6 @@ void __io_uring_task_cancel(void)
 	/* make sure overflow events are dropped */
 	atomic_inc(&tctx->in_idle);
 
-	/* trigger io_disable_sqo_submit() */
 	if (tctx->sqpoll) {
 		struct file *file;
 		unsigned long index;
@@ -8923,6 +8918,7 @@ void __io_uring_task_cancel(void)
 	atomic_dec(&tctx->in_idle);
 
 	io_uring_clean_tctx(tctx);
+	/* all current's requests should be gone, we can kill tctx */
 	__io_uring_free(current);
 }
 
@@ -9004,10 +9000,8 @@ static int io_sqpoll_wait_sq(struct io_ring_ctx *ctx)
 	do {
 		if (!io_sqring_full(ctx))
 			break;
-
 		prepare_to_wait(&ctx->sqo_sq_wait, &wait, TASK_INTERRUPTIBLE);
-
-
+    
 		if (!io_sqring_full(ctx))
 			break;
 
@@ -9641,9 +9635,7 @@ static int io_register_enable_rings(struct io_ring_ctx *ctx)
 	if (ctx->restrictions.registered)
 		ctx->restricted = 1;
 
-
 	io_sq_offload_start(ctx);
-
 	return 0;
 }
 

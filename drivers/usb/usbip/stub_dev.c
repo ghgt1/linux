@@ -87,9 +87,11 @@ static ssize_t usbip_sockfd_store(struct device *dev, struct device_attribute *a
 			sockfd_put(socket);
 			return -EINVAL;
 		}
+
 		get_task_struct(tcp_rx);
 		get_task_struct(tcp_tx);
 
+		/* lock and update sdev->ud state */
 		spin_lock_irq(&sdev->ud.lock);
 		sdev->ud.tcp_socket = socket;
 		sdev->ud.sockfd = sockfd;

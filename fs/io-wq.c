@@ -53,7 +53,6 @@ struct io_worker {
 	struct io_wq_work *cur_work;
 	spinlock_t lock;
 
-
 	struct completion ref_done;
 
 	struct rcu_head rcu;
@@ -137,7 +136,7 @@ struct io_cb_cancel_data {
 };
 
 static void io_wqe_cancel_pending_work(struct io_wqe *wqe,
-		struct io_cb_cancel_data *match);
+				       struct io_cb_cancel_data *match);
 
 static bool io_worker_get(struct io_worker *worker)
 {
@@ -187,7 +186,6 @@ static void io_worker_exit(struct io_worker *worker)
 		atomic_dec(&acct->nr_running);
 	worker->flags = 0;
 	preempt_enable();
-
 
 	raw_spin_lock_irq(&wqe->lock);
 	if (flags & IO_WORKER_F_FREE)
@@ -273,7 +271,6 @@ static void io_wqe_dec_running(struct io_worker *worker)
 	if (atomic_dec_and_test(&acct->nr_running) && io_wqe_run_queue(wqe))
 		io_wqe_wake_worker(wqe, acct);
 }
-
 
 /*
  * Worker will start processing some work. Move it to the busy list, if
@@ -399,8 +396,6 @@ static void io_flush_signals(void)
 	}
 }
 
-
-
 static void io_assign_current_work(struct io_worker *worker,
 				   struct io_wq_work *work)
 {
@@ -486,10 +481,8 @@ static int io_wqe_worker(void *data)
 	struct io_wqe *wqe = worker->wqe;
 	struct io_wq *wq = wqe->wq;
 	char buf[TASK_COMM_LEN];
-
 	worker->flags |= (IO_WORKER_F_UP | IO_WORKER_F_RUNNING);
 	io_wqe_inc_running(worker);
-	
 	sprintf(buf, "iou-wrk-%d", wq->task_pid);
 	set_task_comm(current, buf);
 
@@ -566,7 +559,6 @@ void io_wq_worker_sleeping(struct task_struct *tsk)
 	raw_spin_unlock_irq(&worker->wqe->lock);
 }
 
-
 static bool create_io_worker(struct io_wq *wq, struct io_wqe *wqe, int index)
 {
 	struct io_wqe_acct *acct = &wqe->acct[index];
@@ -617,7 +609,7 @@ static inline bool io_wqe_need_worker(struct io_wqe *wqe, int index)
 	__must_hold(wqe->lock)
 {
 	struct io_wqe_acct *acct = &wqe->acct[index];
-	
+  
 	if (acct->nr_workers && test_bit(IO_WQ_BIT_EXIT, &wqe->wq->state))
 		return false;
 	/* if we have available workers or no work, no need */
@@ -699,6 +691,23 @@ static void io_wq_cancel_pending(struct io_wq *wq)
 }
 
 
+static bool io_wq_work_match_all(struct io_wq_work *work, void *data)
+{
+	return true;
+}
+
+static void io_wq_cancel_pending(struct io_wq *wq)
+{
+	struct io_cb_cancel_data match = {
+		.fn		= io_wq_work_match_all,
+		.cancel_all	= true,
+	};
+	int node;
+
+	for_each_node(node)
+		io_wqe_cancel_pending_work(wq->wqes[node], &match);
+}
+
 /*
  * Manager thread. Tasked with creating new workers, if we need them.
  */
@@ -710,7 +719,7 @@ static int io_wq_manager(void *data)
 
 	sprintf(buf, "iou-mgr-%d", wq->task_pid);
 	set_task_comm(current, buf);
-	
+
 	do {
 		set_current_state(TASK_INTERRUPTIBLE);
 		io_wq_check_workers(wq);
@@ -721,12 +730,13 @@ static int io_wq_manager(void *data)
 	} while (!test_bit(IO_WQ_BIT_EXIT, &wq->state));
 
 	io_wq_check_workers(wq);
-	
+
 	rcu_read_lock();
 	for_each_node(node)
 		io_wq_for_each_worker(wq->wqes[node], io_wq_worker_wake, NULL);
 	rcu_read_unlock();
 
+	/* we might not ever have created any workers */
 	if (atomic_read(&wq->worker_refs))
 		wait_for_completion(&wq->worker_done);
 
@@ -797,7 +807,8 @@ static void io_wqe_enqueue(struct io_wqe *wqe, struct io_wq_work *work)
 
 	/* Can only happen if manager creation fails after exec */
 	if (io_wq_fork_manager(wqe->wq) ||
-		test_bit(IO_WQ_BIT_EXIT, &wqe->wq->state)) {
+	    test_bit(IO_WQ_BIT_EXIT, &wqe->wq->state)) {
+
 		work->flags |= IO_WQ_WORK_CANCEL;
 		wqe->wq->do_work(work);
 		return;
@@ -1077,6 +1088,13 @@ void io_wq_put(struct io_wq *wq)
 	if (refcount_dec_and_test(&wq->refs))
 		io_wq_destroy(wq);
 }
+void io_wq_put_and_exit(struct io_wq *wq)
+{
+	set_bit(IO_WQ_BIT_EXIT, &wq->state);
+	io_wq_destroy_manager(wq);
+	io_wq_put(wq);
+}
+
 void io_wq_put_and_exit(struct io_wq *wq)
 {
 	set_bit(IO_WQ_BIT_EXIT, &wq->state);
